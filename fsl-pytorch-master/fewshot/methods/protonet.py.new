@@ -1,0 +1,97 @@
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+import numpy as np
+import torch.nn.functional as F
+from .meta_template import MetaTemplate
+
+class ProtoNet(MetaTemplate):
+    def __init__(self, model_func,  n_way, n_support):
+        super(ProtoNet, self).__init__(model_func, n_way, n_support)
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.bias = nn.Parameter(
+            torch.FloatTensor(1).fill_(0), requires_grad=True)
+        self.scale_cls = nn.Parameter(
+            torch.FloatTensor(1).fill_(10),
+            requires_grad=True)
+
+        self.ranking_loss = nn.MarginRankingLoss(0.5)
+
+    def set_forward(self, x, is_feature = False):
+        z_support, z_query = self.parse_feature(x, is_feature)
+        z_support = z_support.contiguous()
+        z_proto = z_support.view(self.n_way, self.n_support, -1 ).mean(1)
+        z_query = z_query.contiguous().view(self.n_way * self.n_query, -1 )
+        z_support = z_support.contiguous().view(self.n_way * self.n_support, -1)
+
+        # score
+        dists = euclidean_dist(z_query, z_proto)
+        scores = -dists
+        scores = scores * self.scale_cls + self.bias
+
+        return scores, dists
+
+    def correct(self, x):
+        scores, _ = self.set_forward(x)
+        y_query = np.repeat(range(self.n_way), self.n_query)
+
+        topk_scores, topk_labels = scores.data.topk(1, 1, True, True)
+        topk_ind = topk_labels.cpu().numpy()
+        top1_correct = np.sum(topk_ind[:,0]==y_query)
+        return float(top1_correct), len(y_query)
+
+    def set_forward_loss(self, x):
+        y_proto = Variable(torch.from_numpy(np.repeat(range(self.n_way), 1))).cuda()
+        y_query = Variable(torch.from_numpy(np.repeat(range(self.n_way), self.n_query))).cuda()
+
+        scores, dists = self.set_forward(x)
+        ce_loss = self.loss_fn(scores, y_query)
+
+        '''
+        dist_ap, dist_an = hard_example_mining(dists, y_proto, y_query)
+        y = dist_an.new().resize_as_(dist_an).fill_(1)
+        tp_loss = self.ranking_loss(dist_an, dist_ap, y)
+        #print(dist_an.mean().item(), dist_ap.mean().item(), (dist_an-dist_ap).mean().item())
+        '''
+
+        return ce_loss #tp_loss
+
+
+def hard_example_mining(dist_mat, support_labels, query_labels):
+    assert len(dist_mat.size()) == 2
+    N = dist_mat.size(0)
+    M = dist_mat.size(1)
+    # shape [N, M]
+    support_labels = support_labels.expand(N, M)
+    query_labels = query_labels.reshape(N, -1).expand(N, M)
+
+    is_pos = query_labels.eq(support_labels)
+    is_neg = query_labels.ne(support_labels)
+
+    dist_ap, relative_p_inds = torch.max(
+        dist_mat[is_pos].contiguous().view(N, -1), 1, keepdim=True)
+    dist_an, relative_n_inds = torch.min(
+        dist_mat[is_neg].contiguous().view(N, -1), 1, keepdim=True)
+
+    dist_ap = dist_ap.squeeze(1)
+    dist_an = dist_an.squeeze(1)
+
+    return dist_ap, dist_an
+
+
+def euclidean_dist(x, y):
+    # x: N x D
+    # y: M x D
+
+    x = F.normalize(x, p=2, dim=1, eps=1e-12)
+    y = F.normalize(y, p=2, dim=1, eps=1e-12)
+
+    n = x.size(0)
+    m = y.size(0)
+    d = x.size(1)
+    assert d == y.size(1)
+
+    x = x.unsqueeze(1).expand(n, m, d)
+    y = y.unsqueeze(0).expand(n, m, d)
+
+    return torch.pow(x - y, 2).sum(2).sqrt()
